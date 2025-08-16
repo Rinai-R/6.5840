@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -17,14 +18,22 @@ const (
 )
 
 type Coordinator struct {
-	MapWork          []string
-	MapWorkStatus    []int
-	ReduceWorkStatus []int
-	NReduce          int
-	MapMu            sync.Mutex
-	ReduceMu         sync.Mutex
-	MapDoneNum       atomic.Int32
-	ReduceDoneNum    atomic.Int32
+	MapTask       []Task
+	ReduceTask    []Task
+	NReduce       int
+	Mu            sync.Mutex
+	MapDoneNum    atomic.Int32
+	ReduceDoneNum atomic.Int32
+	LastAssignId  atomic.Int32
+}
+
+type Task struct {
+	FileName string
+	Index    int
+	Type     string
+	Status   int
+	OutTime  time.Time
+	AcceptId int32
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -34,64 +43,70 @@ func (c *Coordinator) AssignTask(args *AssignTaskArgs, reply *AssignTaskReply) e
 		reply.Type = "done"
 		return nil
 	}
-	if c.MapDoneNum.Load() < int32(len(c.MapWork)) {
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+	if c.MapDoneNum.Load() < int32(len(c.MapTask)) {
 		// 分配 map 任务
-		c.MapMu.Lock()
-		for i := 0; i < len(c.MapWorkStatus); i++ {
-			if c.MapWorkStatus[i] == UnAssigned {
-				c.MapWorkStatus[i] = Assigned
+		for i := 0; i < len(c.MapTask); i++ {
+			if c.MapTask[i].Status == UnAssigned {
+				c.LastAssignId.Add(1)
+				c.MapTask[i].AcceptId = c.LastAssignId.Load()
+				c.MapTask[i].Status = Assigned
+				c.MapTask[i].OutTime = time.Now().Add(10 * time.Second)
+
 				reply.Type = "map"
 				reply.WorkId = i
-				reply.FileName = c.MapWork[i]
+				reply.FileName = c.MapTask[i].FileName
 				reply.NReduce = c.NReduce
-				c.MapMu.Unlock()
+				reply.AcceptId = c.MapTask[i].AcceptId
 				return nil
 			}
 		}
-		c.MapMu.Unlock()
 	}
-	if c.ReduceDoneNum.Load() < int32(len(c.MapWork)) {
+	if c.ReduceDoneNum.Load() < int32(len(c.ReduceTask)) {
 		// 分配 reduce 任务
-		c.ReduceMu.Lock()
-		for i := 0; i < len(c.ReduceWorkStatus); i++ {
-			if c.ReduceWorkStatus[i] == UnAssigned {
-				c.ReduceWorkStatus[i] = Assigned
+		for i := 0; i < len(c.ReduceTask); i++ {
+			if c.ReduceTask[i].Status == UnAssigned {
+				c.LastAssignId.Add(1)
+				c.ReduceTask[i].AcceptId = c.LastAssignId.Load()
+				c.ReduceTask[i].Status = Assigned
+				c.ReduceTask[i].OutTime = time.Now().Add(10 * time.Second)
 				reply.Type = "reduce"
 				reply.WorkId = i
-				reply.NMap = len(c.MapWork)
-				c.ReduceMu.Unlock()
+				reply.NMap = len(c.MapTask)
+
 				return nil
 			}
 		}
-		c.ReduceMu.Unlock()
 	}
 	reply.Type = "wait"
 	return nil
 }
 
 func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error {
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
 	switch args.Type {
 	case "map":
+		if c.MapTask[args.WorkId].Status != Assigned || args.AcceptId != c.MapTask[args.WorkId].AcceptId {
+			return nil
+		}
 		if args.Status == "done" {
-			c.MapMu.Lock()
-			c.MapWorkStatus[args.WorkId] = Done
+			c.MapTask[args.WorkId].Status = Done
 			c.MapDoneNum.Add(1)
-			c.MapMu.Unlock()
 		} else {
-			c.MapMu.Lock()
-			c.MapWorkStatus[args.WorkId] = UnAssigned
-			c.MapMu.Unlock()
+			c.MapTask[args.WorkId].Status = UnAssigned
 		}
 	case "reduce":
+		// 防止 Task 重复 report
+		if c.ReduceTask[args.WorkId].Status != Assigned || args.AcceptId != c.ReduceTask[args.WorkId].AcceptId {
+			return nil
+		}
 		if args.Status == "done" {
-			c.ReduceMu.Lock()
-			c.ReduceWorkStatus[args.WorkId] = Done
+			c.ReduceTask[args.WorkId].Status = Done
 			c.ReduceDoneNum.Add(1)
-			c.ReduceMu.Unlock()
 		} else {
-			c.ReduceMu.Lock()
-			c.ReduceWorkStatus[args.WorkId] = UnAssigned
-			c.ReduceMu.Unlock()
+			c.ReduceTask[args.WorkId].Status = UnAssigned
 		}
 	}
 	return nil
@@ -130,17 +145,59 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{
-		MapWork:          files,
-		MapWorkStatus:    make([]int, len(files)),
-		ReduceWorkStatus: make([]int, nReduce),
-		NReduce:          nReduce,
-		MapMu:            sync.Mutex{},
-		ReduceMu:         sync.Mutex{},
-		ReduceDoneNum:    atomic.Int32{},
-		MapDoneNum:       atomic.Int32{},
+	ReduceTask := make([]Task, nReduce)
+	for i := 0; i < nReduce; i++ {
+		ReduceTask[i] = Task{
+			FileName: "",
+			Index:    i,
+			Type:     "reduce",
+			Status:   UnAssigned,
+			OutTime:  time.Now(),
+			AcceptId: -1,
+		}
 	}
-
+	MapTask := make([]Task, len(files))
+	for i := 0; i < len(files); i++ {
+		MapTask[i] = Task{
+			FileName: files[i],
+			Index:    i,
+			Type:     "map",
+			Status:   UnAssigned,
+			OutTime:  time.Now(),
+			AcceptId: -1,
+		}
+	}
+	c := Coordinator{
+		MapTask:       MapTask,
+		ReduceTask:    ReduceTask,
+		NReduce:       nReduce,
+		Mu:            sync.Mutex{},
+		ReduceDoneNum: atomic.Int32{},
+		MapDoneNum:    atomic.Int32{},
+		LastAssignId:  atomic.Int32{},
+	}
+	// 回收超时的任务
+	go c.CheckOutTime()
 	c.server()
 	return &c
+}
+
+func (c *Coordinator) CheckOutTime() {
+	tick := time.NewTicker(time.Second * 5)
+	for range tick.C {
+		c.Mu.Lock()
+		for i := 0; i < len(c.MapTask); i++ {
+			if c.MapTask[i].Status == Assigned && time.Since(c.MapTask[i].OutTime) > time.Second*10 {
+				// log.Printf("map task %d is out of time", i)
+				c.MapTask[i].Status = UnAssigned
+			}
+		}
+		for i := 0; i < len(c.ReduceTask); i++ {
+			if c.ReduceTask[i].Status == Assigned && time.Since(c.ReduceTask[i].OutTime) > time.Second*10 {
+				// log.Printf("reduce task %d is out of time", i)
+				c.ReduceTask[i].Status = UnAssigned
+			}
+		}
+		c.Mu.Unlock()
+	}
 }

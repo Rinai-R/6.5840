@@ -32,7 +32,7 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	for i := 0; ; i++ {
+	for {
 		reply, err := CallAssignTask()
 		if err != nil {
 			fmt.Println(err)
@@ -56,17 +56,19 @@ func Worker(mapf func(string, string) []KeyValue,
 			err = doMap(kvs, reply.NReduce, reply.WorkId)
 			if err != nil {
 				req := &ReportTaskArgs{
-					Type:   "map",
-					WorkId: reply.WorkId,
-					Status: "failed",
+					Type:     "map",
+					WorkId:   reply.WorkId,
+					Status:   "failed",
+					AcceptId: reply.AcceptId,
 				}
 				CallReportTask(req)
 				continue
 			}
 			req := &ReportTaskArgs{
-				Type:   "map",
-				WorkId: reply.WorkId,
-				Status: "done",
+				Type:     "map",
+				WorkId:   reply.WorkId,
+				Status:   "done",
+				AcceptId: reply.AcceptId,
 			}
 			CallReportTask(req)
 		case "reduce":
@@ -74,17 +76,19 @@ func Worker(mapf func(string, string) []KeyValue,
 			err = doReduce(reply.WorkId, reply.NReduce, reply.NMap, reducef)
 			if err != nil {
 				req := &ReportTaskArgs{
-					Type:   "reduce",
-					WorkId: reply.WorkId,
-					Status: "failed",
+					Type:     "reduce",
+					WorkId:   reply.WorkId,
+					Status:   "failed",
+					AcceptId: reply.AcceptId,
 				}
 				CallReportTask(req)
 				continue
 			}
 			req := &ReportTaskArgs{
-				Type:   "reduce",
-				WorkId: reply.WorkId,
-				Status: "done",
+				Type:     "reduce",
+				WorkId:   reply.WorkId,
+				Status:   "done",
+				AcceptId: reply.AcceptId,
 			}
 			CallReportTask(req)
 		case "wait":
