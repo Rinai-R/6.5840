@@ -2,6 +2,7 @@ package tester
 
 import (
 	//"log"
+
 	"strconv"
 	"sync"
 
@@ -178,7 +179,7 @@ func (sg *ServerGrp) disconnect(i int, from []int) {
 	sg.mu.Lock()
 	sg.connected[i] = false
 	sg.mu.Unlock()
-
+	// fmt.Printf("%v挂掉了\n", i)
 	// outgoing socket files
 	sg.srvs[i].disconnect(from)
 
