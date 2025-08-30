@@ -374,11 +374,13 @@ func (rf *Raft) sendHeartBeat(server int, args *AppendEntriesArgs, reply *Append
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	if rf.role != Leader || rf.killed() {
 		return -1, -1, false
 	}
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+
 	index := len(rf.logs)
 	term := rf.currentTerm
 	isLeader := rf.me == rf.leaderIdx
@@ -449,16 +451,24 @@ func (rf *Raft) StartElection() {
 	rf.persist()
 	rf.leaderIdx = -1
 	rf.lastHeartBeatTime = time.Now()
-	rf.mu.Unlock()
-	// 构造参数
+
+	// 构造参数 - 在锁内获取日志信息
 	args := &RequestVoteArgs{
 		Term:        rf.currentTerm,
 		CandidateId: rf.me,
 	}
+	lastLogIndex := rf.getLastLogIndex()
+	lastLogTerm := rf.termAt(lastLogIndex)
 	term := rf.currentTerm
-	voteNum := &atomic.Int64{}
 	quorum := len(rf.peers) / 2
 	me := rf.me
+	rf.mu.Unlock()
+
+	// 设置参数中的日志信息
+	args.LastLogIndex = lastLogIndex
+	args.LastLogTerm = lastLogTerm
+
+	voteNum := &atomic.Int64{}
 
 	// 请求投票
 	for idx := range rf.peers {
@@ -468,8 +478,6 @@ func (rf *Raft) StartElection() {
 		// fmt.Printf("第%v任期：%v 发起选举，请求%v投票\n", rf.currentTerm, rf.me, idx)
 		// 用 goroutine 是为了防止有的节点挂了导致回复超时。
 		go func(server int) {
-			args.LastLogIndex = rf.getLastLogIndex()
-			args.LastLogTerm = rf.termAt(args.LastLogIndex)
 			var reply RequestVoteReply
 			ok := rf.sendRequestVote(server, args, &reply)
 			if !ok {
@@ -520,9 +528,17 @@ func (rf *Raft) StartElection() {
 
 func (rf *Raft) SendHeartBeat() {
 	rf.mu.Lock()
+	if rf.role != Leader || rf.killed() {
+		rf.mu.Unlock()
+		return
+	}
+
 	term := rf.currentTerm
 	me := rf.me
 	quorum := len(rf.peers)/2 + 1
+
+	// 预取所有需要的状态
+	commitIdx := rf.commitIdx
 	rf.mu.Unlock()
 
 	for i := range rf.peers {
@@ -538,19 +554,30 @@ func (rf *Raft) SendHeartBeat() {
 					rf.mu.Unlock()
 					return
 				}
+
 				prevIdx := rf.nextIndex[server] - 1
 				prevTerm := rf.termAt(prevIdx)
-				entries := make([]LogEntry, len(rf.logs[rf.nextIndex[server]:]))
-				copy(entries, rf.logs[rf.nextIndex[server]:])
+
+				// 计算需要发送的条目
+				startIdx := rf.nextIndex[server]
+				var entries []LogEntry
+				if startIdx < len(rf.logs) {
+					entries = make([]LogEntry, len(rf.logs[startIdx:]))
+					copy(entries, rf.logs[startIdx:])
+				} else {
+					entries = []LogEntry{}
+				}
+
 				args := &AppendEntriesArgs{
 					Term:         term,
 					LeaderIdx:    me,
 					PrevLogIdx:   prevIdx,
 					PrevLogTerm:  prevTerm,
 					Entries:      entries,
-					LeaderCommit: rf.commitIdx,
+					LeaderCommit: commitIdx,
 				}
 				rf.mu.Unlock()
+
 				// 无锁 rpc 调用
 				var reply AppendEntriesReply
 				ok := rf.sendHeartBeat(server, args, &reply)
@@ -582,7 +609,7 @@ func (rf *Raft) SendHeartBeat() {
 					}
 					// commitIdx 倒序遍历进行推进
 					for N := len(rf.logs) - 1; N > rf.commitIdx; N-- {
-						// 值得注意的一点，就是旧 term 就算被写入绝大多数节点，也不能视作“安全”
+						// 值得注意的一点，就是旧 term 就算被写入绝大多数节点，也不能视作"安全"
 						if rf.logs[N].Term != rf.currentTerm {
 							continue
 						}
