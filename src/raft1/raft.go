@@ -9,12 +9,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -61,6 +63,9 @@ func (rf *Raft) getLastLogIndex() int {
 }
 
 func (rf *Raft) termAt(index int) int {
+	if len(rf.logs) <= index || index < 0 {
+		return 0
+	}
 	return rf.logs[index].Term
 }
 
@@ -83,34 +88,39 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.logs)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var voteFor int
+	var logs []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&voteFor) != nil ||
+		d.Decode(&logs) != nil {
+		DPrintf("error restoring state from stable storage")
+	}
+	rf.currentTerm = currentTerm
+	rf.voteFor = voteFor
+	rf.logs = logs
+	lastIdx := rf.getLastLogIndex()
+	for i := range rf.peers {
+		rf.nextIndex[i] = lastIdx + 1
+		rf.matchIndex[i] = 0
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -157,6 +167,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// changed 统一做持久化
+	changed := false
+	defer func() {
+		if changed {
+			rf.persist()
+		}
+	}()
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
@@ -174,6 +191,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 日志不够新，拒绝投票
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		changed = true
 		return
 	}
 	// 如果任期对方比自己更早
@@ -184,11 +202,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.leaderIdx = -1
 		rf.role = Follower
 		reply.Term = rf.currentTerm
+		changed = true
 	}
 	// 只有在没有投票的时候才会投票
 	if rf.voteFor == -1 || rf.voteFor == args.CandidateId {
 		rf.lastHeartBeatTime = time.Now()
 		rf.voteFor = args.CandidateId
+		changed = true
 		reply.VoteGranted = true
 		// fmt.Printf("第%v任期：%v投票给%v\n", rf.currentTerm, rf.me, args.CandidateId)
 		return
@@ -251,6 +271,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
@@ -289,7 +310,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// 这里开始追加日志
-
 	idx := args.PrevLogIdx + 1
 	// fmt.Printf("节点%v追加日志：%v，当前日志%v\n", rf.me, args.Entries, rf.logs)
 
@@ -315,8 +335,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
-	for args.LeaderCommit > rf.commitIdx && rf.getLastLogIndex() > rf.commitIdx {
-		rf.commitIdx++
+	// commitIdx推进用min(args.LeaderCommit, getLastLogIndex())
+	if args.LeaderCommit > rf.commitIdx {
+		last := rf.getLastLogIndex()
+		if args.LeaderCommit < last {
+			rf.commitIdx = args.LeaderCommit
+		} else {
+			rf.commitIdx = last
+		}
 	}
 
 	// 更新一些状态。
@@ -363,6 +389,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    term,
 		Command: command,
 	})
+	rf.persist()
 	// Your code here (3B).
 	// if rf.role == Leader {
 	// 	fmt.Printf("节点%v写入日志命令%v, 日志长度%v\n", rf.me, command, rf.logs)
@@ -419,6 +446,7 @@ func (rf *Raft) StartElection() {
 	rf.role = Candidate
 	rf.currentTerm += 1
 	rf.voteFor = rf.me
+	rf.persist()
 	rf.leaderIdx = -1
 	rf.lastHeartBeatTime = time.Now()
 	rf.mu.Unlock()
@@ -461,6 +489,7 @@ func (rf *Raft) StartElection() {
 				rf.role = Follower
 				rf.leaderIdx = -1
 				rf.voteFor = -1
+				rf.persist()
 				// 防止立刻又去选举
 				rf.lastHeartBeatTime = time.Now()
 				return
@@ -478,7 +507,7 @@ func (rf *Raft) StartElection() {
 						if i == me {
 							continue
 						}
-						rf.nextIndex[i] = len(rf.logs)
+						rf.nextIndex[i] = rf.getLastLogIndex() + 1
 						rf.matchIndex[i] = 0
 					}
 					// 立刻异步发一波心跳
@@ -487,7 +516,6 @@ func (rf *Raft) StartElection() {
 			}
 		}(idx)
 	}
-
 }
 
 func (rf *Raft) SendHeartBeat() {
@@ -537,6 +565,7 @@ func (rf *Raft) SendHeartBeat() {
 					rf.role = Follower
 					rf.leaderIdx = reply.LeaderIdx
 					rf.voteFor = -1
+					rf.persist()
 					rf.lastHeartBeatTime = time.Now()
 					rf.mu.Unlock()
 					return
@@ -553,6 +582,7 @@ func (rf *Raft) SendHeartBeat() {
 					}
 					// commitIdx 倒序遍历进行推进
 					for N := len(rf.logs) - 1; N > rf.commitIdx; N-- {
+						// 值得注意的一点，就是旧 term 就算被写入绝大多数节点，也不能视作“安全”
 						if rf.logs[N].Term != rf.currentTerm {
 							continue
 						}
@@ -598,8 +628,7 @@ func (rf *Raft) applyLoop(applyCh chan raftapi.ApplyMsg) {
 	for !rf.killed() {
 		rf.mu.Lock()
 		var msgs []raftapi.ApplyMsg
-
-		for rf.commitIdx > rf.lastAppliedIdx {
+		for rf.commitIdx > rf.lastAppliedIdx && rf.lastAppliedIdx < rf.getLastLogIndex() {
 			rf.lastAppliedIdx += 1
 			msgs = append(msgs, raftapi.ApplyMsg{
 				CommandValid: true,
@@ -607,11 +636,11 @@ func (rf *Raft) applyLoop(applyCh chan raftapi.ApplyMsg) {
 				CommandIndex: rf.lastAppliedIdx,
 			})
 		}
-		rf.mu.Unlock()
-
+		// 这里必须在锁内apply，防止竞态
 		for _, msg := range msgs {
 			applyCh <- msg
 		}
+		rf.mu.Unlock()
 		time.Sleep(10 * time.Millisecond)
 	}
 }
