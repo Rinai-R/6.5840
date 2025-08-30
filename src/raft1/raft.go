@@ -419,26 +419,31 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	for !rf.killed() {
-		// fmt.Printf("%v监听\n", rf.me)
+	// 启动一个 goroutine 来定期发送心跳
+	go func() {
+		for !rf.killed() {
+			rf.mu.Lock()
+			if rf.leaderIdx == rf.me {
+				rf.mu.Unlock()
+				rf.SendHeartBeat()
+			} else {
+				rf.mu.Unlock()
+			}
+			time.Sleep(75 * time.Millisecond) // 每 50ms 发送一次心跳
+		}
+	}()
 
-		// 这里加锁读取
+	for !rf.killed() {
 		rf.mu.Lock()
-		role := rf.role
 		leader := rf.leaderIdx
-		timeout := rf.lastHeartBeatTime.Add(rf.outTime).Before(time.Now())
+		timeout := time.Since(rf.lastHeartBeatTime) >= time.Duration(rf.outTime)
 		rf.mu.Unlock()
 
-		// 没领导的时候或超时的时候，如果还没有给别人投票并且自己是 follower
-		if (leader == -1 || timeout) && role != Leader {
-
+		if (leader == -1 || timeout) && rf.role != Leader {
 			rf.StartElection()
 		}
-		if leader == rf.me {
-			rf.SendHeartBeat()
-		}
-		ms := 50 + (rand.Int63() % 300) // 50~350ms tick
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+
+		time.Sleep(time.Duration(100+(rand.Int63()%200)) * time.Millisecond)
 	}
 }
 
@@ -498,8 +503,6 @@ func (rf *Raft) StartElection() {
 				rf.leaderIdx = -1
 				rf.voteFor = -1
 				rf.persist()
-				// 防止立刻又去选举
-				rf.lastHeartBeatTime = time.Now()
 				return
 			}
 			if reply.VoteGranted {
@@ -593,7 +596,6 @@ func (rf *Raft) SendHeartBeat() {
 					rf.leaderIdx = reply.LeaderIdx
 					rf.voteFor = -1
 					rf.persist()
-					rf.lastHeartBeatTime = time.Now()
 					rf.mu.Unlock()
 					return
 				}
@@ -690,7 +692,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.leaderIdx = -1
 	rf.voteFor = -1
-	rf.outTime = 1000 * time.Millisecond
+	rf.outTime = 1 * time.Second
 	rf.role = Follower
 	rf.logs = make([]LogEntry, 0)
 	rf.logs = append(rf.logs, LogEntry{
