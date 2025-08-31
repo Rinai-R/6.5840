@@ -7,7 +7,7 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	//	"bytes"
+	//    "bytes"
 
 	"bytes"
 	"math/rand"
@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	//    "6.5840/labgob"
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
@@ -165,15 +165,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		return
 	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// changed 统一做持久化
-	changed := false
-	defer func() {
-		if changed {
-			rf.persist()
-		}
-	}()
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
@@ -183,35 +177,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	myIdx := rf.getLastLogIndex()
-	myTerm := rf.termAt(myIdx)
-	// fmt.Printf("判断条件：%v > %v || (%v == %v && %v >= %v)\n", args.LastLogTerm, myTerm, args.LastLogTerm, myTerm, args.LastLogIndex, myIdx)
-	if !(args.LastLogTerm > myTerm ||
-		(args.LastLogTerm == myTerm && args.LastLogIndex >= myIdx)) {
-		// 日志不够新，拒绝投票
-		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
-		changed = true
-		return
-	}
-	// 如果任期对方比自己更早
 	if args.Term > rf.currentTerm {
-		// 一切状态都要更新
 		rf.currentTerm = args.Term
 		rf.voteFor = -1
 		rf.leaderIdx = -1
 		rf.role = Follower
+		rf.persist()
 		reply.Term = rf.currentTerm
-		changed = true
 	}
 	// 只有在没有投票的时候才会投票
 	if rf.voteFor == -1 || rf.voteFor == args.CandidateId {
-		rf.lastHeartBeatTime = time.Now()
-		rf.voteFor = args.CandidateId
-		changed = true
-		reply.VoteGranted = true
-		// fmt.Printf("第%v任期：%v投票给%v\n", rf.currentTerm, rf.me, args.CandidateId)
-		return
+
+		lastLogIndex := rf.getLastLogIndex()
+		lastLogTerm := rf.termAt(lastLogIndex)
+
+		if args.LastLogTerm > lastLogTerm ||
+			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
+			rf.voteFor = args.CandidateId
+			rf.lastHeartBeatTime = time.Now()
+			rf.persist()
+			reply.VoteGranted = true
+			// fmt.Printf("第%v任期：%v投票给%v\n", rf.currentTerm, rf.me, args.CandidateId)
+		}
 	}
 }
 
@@ -394,7 +381,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 	// Your code here (3B).
 	// if rf.role == Leader {
-	// 	fmt.Printf("节点%v写入日志命令%v, 日志长度%v\n", rf.me, command, rf.logs)
+	//     fmt.Printf("节点%v写入日志命令%v, 日志长度%v\n", rf.me, command, rf.logs)
 	// }
 	return index, term, isLeader
 }
@@ -418,66 +405,82 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) generateElectionTimeout() time.Duration {
+	return time.Duration(150+rand.Intn(200)) * time.Millisecond
+}
+
 func (rf *Raft) ticker() {
 	// 启动一个 goroutine 来定期发送心跳
 	go func() {
+		heartbeatTicker := time.NewTicker(50 * time.Millisecond)
+		defer heartbeatTicker.Stop()
+
 		for !rf.killed() {
-			rf.mu.Lock()
-			if rf.leaderIdx == rf.me {
-				rf.mu.Unlock()
-				rf.SendHeartBeat()
-			} else {
-				rf.mu.Unlock()
+			select {
+			case <-heartbeatTicker.C:
+				rf.mu.Lock()
+				if rf.role == Leader {
+					rf.mu.Unlock()
+					go rf.SendHeartBeat()
+				} else {
+					rf.mu.Unlock()
+				}
+			default:
+				time.Sleep(10 * time.Millisecond)
 			}
-			time.Sleep(75 * time.Millisecond) // 每 50ms 发送一次心跳
 		}
 	}()
 
+	// 选举超时检测
 	for !rf.killed() {
 		rf.mu.Lock()
-		leader := rf.leaderIdx
-		timeout := time.Since(rf.lastHeartBeatTime) >= time.Duration(rf.outTime)
-		rf.mu.Unlock()
+		isLeader := rf.role == Leader
+		timeSinceHeartbeat := time.Since(rf.lastHeartBeatTime)
 
-		if (leader == -1 || timeout) && rf.role != Leader {
+		if !isLeader && timeSinceHeartbeat >= rf.outTime {
+			rf.mu.Unlock()
 			rf.StartElection()
+		} else {
+			rf.mu.Unlock()
 		}
 
-		time.Sleep(time.Duration(100+(rand.Int63()%200)) * time.Millisecond)
+		time.Sleep(rf.generateElectionTimeout())
 	}
 }
 
 func (rf *Raft) StartElection() {
-	// 先给自己投票
 	rf.mu.Lock()
+	if rf.killed() || rf.role == Leader {
+		rf.mu.Unlock()
+		return
+	}
+	// fmt.Printf("节点%v在任期%v发起选举\n", rf.me, rf.currentTerm)
+	// 转换为候选人状态
 	rf.role = Candidate
 	rf.currentTerm += 1
 	rf.voteFor = rf.me
-	rf.persist()
-	rf.leaderIdx = -1
 	rf.lastHeartBeatTime = time.Now()
+	rf.persist()
 
-	// 构造参数 - 在锁内获取日志信息
-	args := &RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateId: rf.me,
-	}
+	term := rf.currentTerm
+	me := rf.me
 	lastLogIndex := rf.getLastLogIndex()
 	lastLogTerm := rf.termAt(lastLogIndex)
-	term := rf.currentTerm
-	quorum := len(rf.peers) / 2
-	me := rf.me
+	quorum := len(rf.peers)/2 + 1
 	rf.mu.Unlock()
 
-	// 设置参数中的日志信息
-	args.LastLogIndex = lastLogIndex
-	args.LastLogTerm = lastLogTerm
-
 	voteNum := &atomic.Int64{}
+	voteNum.Add(1)
 
-	// 请求投票
-	for idx := range rf.peers {
-		if idx == me {
+	args := &RequestVoteArgs{
+		Term:         term,
+		CandidateId:  me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
+
+	for server := range rf.peers {
+		if server == me {
 			continue
 		}
 		// fmt.Printf("第%v任期：%v 发起选举，请求%v投票\n", rf.currentTerm, rf.me, idx)
@@ -496,6 +499,7 @@ func (rf *Raft) StartElection() {
 			if rf.currentTerm != term || rf.role != Candidate {
 				return
 			}
+
 			if reply.Term > rf.currentTerm {
 				// 看到更高term，立刻降级
 				rf.currentTerm = reply.Term
@@ -507,25 +511,26 @@ func (rf *Raft) StartElection() {
 			}
 			if reply.VoteGranted {
 				voteNum.Add(1)
+
 				// fmt.Printf("第%v任期：%v 发起选举，请求%v投票成功，持票数%v\n", rf.currentTerm, rf.me, idx, voteNum.Load())
-				if int(voteNum.Load()) >= quorum &&
-					rf.role == Candidate && rf.currentTerm == term {
-					// fmt.Println("当leader了")
-					// 当选Leader
+				if int(voteNum.Load()) >= quorum {
+					// fmt.Printf("节点%v在任期%v获得多数票，成为leader\n", me, term)
 					rf.role = Leader
 					rf.leaderIdx = me
+
+					// 初始化leader状态
+					lastIdx := rf.getLastLogIndex()
 					for i := range rf.peers {
-						if i == me {
-							continue
-						}
-						rf.nextIndex[i] = rf.getLastLogIndex() + 1
+						rf.nextIndex[i] = lastIdx + 1
 						rf.matchIndex[i] = 0
 					}
+
+					rf.persist()
 					// 立刻异步发一波心跳
 					go rf.SendHeartBeat()
 				}
 			}
-		}(idx)
+		}(server)
 	}
 }
 
@@ -692,7 +697,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.leaderIdx = -1
 	rf.voteFor = -1
-	rf.outTime = 1 * time.Second
+	rf.outTime = rf.generateElectionTimeout()
 	rf.role = Follower
 	rf.logs = make([]LogEntry, 0)
 	rf.logs = append(rf.logs, LogEntry{
