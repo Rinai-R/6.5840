@@ -59,22 +59,23 @@ type LogEntry struct {
 	Command interface{}
 }
 
+// 日志采取 1 索引模式
 func (rf *Raft) getLastLogIndex() int {
-	return len(rf.logs) + rf.lastSnapshotIndex - 1
+	return len(rf.logs) + rf.lastSnapshotIndex
 }
 
 func (rf *Raft) termAt(index int) int {
-	if len(rf.logs) <= index-rf.lastSnapshotIndex || index-rf.lastSnapshotIndex < 0 {
+	if len(rf.logs) < index-rf.lastSnapshotIndex || index-rf.lastSnapshotIndex <= 0 {
 		return 0
 	}
-	return rf.logs[index-rf.lastSnapshotIndex].Term
+	return rf.logs[index-rf.lastSnapshotIndex-1].Term
 }
 
 func (rf *Raft) getLog(index int) LogEntry {
 	if index <= rf.lastSnapshotIndex || index > rf.getLastLogIndex() {
 		return LogEntry{}
 	}
-	return rf.logs[index-rf.lastSnapshotIndex]
+	return rf.logs[index-rf.lastSnapshotIndex-1]
 }
 
 func (rf *Raft) logsStartIn(index int) []LogEntry {
@@ -83,7 +84,7 @@ func (rf *Raft) logsStartIn(index int) []LogEntry {
 	} else if index > rf.getLastLogIndex() {
 		return []LogEntry{}
 	}
-	return rf.logs[index-rf.lastSnapshotIndex:]
+	return rf.logs[index-rf.lastSnapshotIndex-1:]
 }
 
 func (rf *Raft) logsEndIn(index int) []LogEntry {
@@ -92,7 +93,7 @@ func (rf *Raft) logsEndIn(index int) []LogEntry {
 	} else if index > rf.getLastLogIndex() {
 		return rf.logs
 	}
-	return rf.logs[:index-rf.lastSnapshotIndex]
+	return rf.logs[:index-rf.lastSnapshotIndex-1]
 }
 
 // return currentTerm and whether this server
@@ -726,10 +727,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.outTime = rf.generateElectionTimeout()
 	rf.role = Follower
 	rf.logs = make([]LogEntry, 0)
-	rf.logs = append(rf.logs, LogEntry{
-		Term:    0,
-		Command: nil,
-	})
 	rf.applyCh = applyCh
 	rf.commitIdx = 0
 	rf.lastAppliedIdx = 0
