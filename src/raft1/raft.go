@@ -48,6 +48,7 @@ type Raft struct {
 	nextIndex         []int                 // 对于每一个服务器，下一次发送日志的索引
 	matchIndex        []int                 // 对于每一个服务器，已知的最新的日志索引
 	applyCh           chan raftapi.ApplyMsg // 用于通知 leader 节点 apply 日志
+	lastSnapshotIndex int                   // 最后一次 snapshot 的索引
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -59,14 +60,39 @@ type LogEntry struct {
 }
 
 func (rf *Raft) getLastLogIndex() int {
-	return len(rf.logs) - 1
+	return len(rf.logs) + rf.lastSnapshotIndex - 1
 }
 
 func (rf *Raft) termAt(index int) int {
-	if len(rf.logs) <= index || index < 0 {
+	if len(rf.logs) <= index-rf.lastSnapshotIndex || index-rf.lastSnapshotIndex < 0 {
 		return 0
 	}
-	return rf.logs[index].Term
+	return rf.logs[index-rf.lastSnapshotIndex].Term
+}
+
+func (rf *Raft) getLog(index int) LogEntry {
+	if index <= rf.lastSnapshotIndex || index > rf.getLastLogIndex() {
+		return LogEntry{}
+	}
+	return rf.logs[index-rf.lastSnapshotIndex]
+}
+
+func (rf *Raft) logsStartIn(index int) []LogEntry {
+	if index <= rf.lastSnapshotIndex {
+		return rf.logs
+	} else if index > rf.getLastLogIndex() {
+		return []LogEntry{}
+	}
+	return rf.logs[index-rf.lastSnapshotIndex:]
+}
+
+func (rf *Raft) logsEndIn(index int) []LogEntry {
+	if index <= rf.lastSnapshotIndex {
+		return []LogEntry{}
+	} else if index > rf.getLastLogIndex() {
+		return rf.logs
+	}
+	return rf.logs[:index-rf.lastSnapshotIndex]
 }
 
 // return currentTerm and whether this server
@@ -306,10 +332,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// fmt.Printf("节点 %v 对 follower%v 追加操作：%v\n", args.LeaderIdx, rf.me, len(args.Entries))
 		if idx+i <= rf.getLastLogIndex() {
 			// 已有日志位置，检查 term 是否一致
-			if rf.logs[idx+i].Term != entry.Term {
+			if rf.getLog(idx+i).Term != entry.Term {
 				// fmt.Printf("节点%v日志和leader%v在索引%v处term%v冲突，leader覆盖\n", rf.me, args.LeaderIdx, idx+i, rf.logs[idx+i].Term)
 				// term 不同，截断掉这条以及之后的日志
-				rf.logs = rf.logs[:idx+i]
+				rf.logs = rf.logsEndIn(idx + i)
 				// 把剩余 entries 整体追加
 				rf.logs = append(rf.logs, args.Entries[i:]...)
 				break
@@ -368,7 +394,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
-	index := len(rf.logs)
+	index := rf.getLastLogIndex() + 1
 	term := rf.currentTerm
 	isLeader := rf.me == rf.leaderIdx
 
@@ -569,9 +595,9 @@ func (rf *Raft) SendHeartBeat() {
 				// 计算需要发送的条目
 				startIdx := rf.nextIndex[server]
 				var entries []LogEntry
-				if startIdx < len(rf.logs) {
-					entries = make([]LogEntry, len(rf.logs[startIdx:]))
-					copy(entries, rf.logs[startIdx:])
+				if startIdx < rf.getLastLogIndex()+1 {
+					entries = make([]LogEntry, len(rf.logsStartIn(startIdx)))
+					copy(entries, rf.logsStartIn(startIdx))
 				} else {
 					entries = []LogEntry{}
 				}
@@ -615,9 +641,9 @@ func (rf *Raft) SendHeartBeat() {
 						rf.nextIndex[server] = ne
 					}
 					// commitIdx 倒序遍历进行推进
-					for N := len(rf.logs) - 1; N > rf.commitIdx; N-- {
+					for N := rf.getLastLogIndex(); N > rf.commitIdx; N-- {
 						// 值得注意的一点，就是旧 term 就算被写入绝大多数节点，也不能视作"安全"
-						if rf.logs[N].Term != rf.currentTerm {
+						if rf.getLog(N).Term != rf.currentTerm {
 							continue
 						}
 						cnt := 1
@@ -666,7 +692,7 @@ func (rf *Raft) applyLoop(applyCh chan raftapi.ApplyMsg) {
 			rf.lastAppliedIdx += 1
 			msgs = append(msgs, raftapi.ApplyMsg{
 				CommandValid: true,
-				Command:      rf.logs[rf.lastAppliedIdx].Command,
+				Command:      rf.getLog(rf.lastAppliedIdx).Command,
 				CommandIndex: rf.lastAppliedIdx,
 			})
 		}
