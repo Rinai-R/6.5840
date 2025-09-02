@@ -7,15 +7,12 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	//    "bytes"
-
 	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//    "6.5840/labgob"
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
@@ -49,6 +46,7 @@ type Raft struct {
 	matchIndex        []int                 // 对于每一个服务器，已知的最新的日志索引
 	applyCh           chan raftapi.ApplyMsg // 用于通知 leader 节点 apply 日志
 	lastSnapshotIndex int                   // 最后一次 snapshot 的索引
+	lastSnapshotTerm  int                   // 最后一次 snapshot 的任期
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -65,7 +63,10 @@ func (rf *Raft) getLastLogIndex() int {
 }
 
 func (rf *Raft) termAt(index int) int {
-	if len(rf.logs) < index-rf.lastSnapshotIndex || index-rf.lastSnapshotIndex <= 0 {
+	if index == rf.lastSnapshotIndex {
+		return rf.lastSnapshotTerm
+	}
+	if len(rf.logs) < index-rf.lastSnapshotIndex || index-rf.lastSnapshotIndex < 0 {
 		return 0
 	}
 	return rf.logs[index-rf.lastSnapshotIndex-1].Term
@@ -121,8 +122,10 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.voteFor)
 	e.Encode(rf.logs)
+	e.Encode(rf.lastSnapshotIndex)
+	e.Encode(rf.lastSnapshotTerm)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.persister.ReadSnapshot())
 }
 
 // restore previously persisted state.
@@ -135,14 +138,26 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var voteFor int
 	var logs []LogEntry
+	var lastSnapshotIndex int
+	var lastSnapshotTerm int
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&voteFor) != nil ||
-		d.Decode(&logs) != nil {
+		d.Decode(&logs) != nil ||
+		d.Decode(&lastSnapshotIndex) != nil ||
+		d.Decode(&lastSnapshotTerm) != nil {
 		DPrintf("error restoring state from stable storage")
 	}
 	rf.currentTerm = currentTerm
 	rf.voteFor = voteFor
 	rf.logs = logs
+	rf.lastSnapshotIndex = lastSnapshotIndex
+	rf.lastSnapshotTerm = lastSnapshotTerm
+	if rf.commitIdx < rf.lastSnapshotIndex {
+		rf.commitIdx = rf.lastSnapshotIndex
+	}
+	if rf.lastAppliedIdx < rf.lastSnapshotIndex {
+		rf.lastAppliedIdx = rf.lastSnapshotIndex
+	}
 	lastIdx := rf.getLastLogIndex()
 	for i := range rf.peers {
 		rf.nextIndex[i] = lastIdx + 1
@@ -161,9 +176,138 @@ func (rf *Raft) PersistBytes() int {
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
+// 会更新 lastSnapshotIndex/Term 和 logs
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// Your code here (3D).
+	if index <= rf.lastSnapshotIndex || index > rf.getLastLogIndex() {
+		return
+	}
 
+	lastSnapshotTerm := rf.termAt(index)
+	rf.lastSnapshotTerm = lastSnapshotTerm
+	suffix := rf.logsStartIn(index + 1)
+
+	rf.logs = make([]LogEntry, len(suffix))
+	copy(rf.logs, suffix)
+	rf.lastSnapshotIndex = index
+
+	if rf.commitIdx < rf.lastSnapshotIndex {
+		rf.commitIdx = rf.lastSnapshotIndex
+	}
+	if rf.lastAppliedIdx < rf.lastSnapshotIndex {
+		rf.lastAppliedIdx = rf.lastSnapshotIndex
+	}
+
+	term := rf.currentTerm
+	votefor := rf.voteFor
+	logs := rf.logs
+	lastSnapshotIndex := rf.lastSnapshotIndex
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(term)
+	e.Encode(votefor)
+	e.Encode(logs)
+	e.Encode(lastSnapshotIndex)
+	e.Encode(lastSnapshotTerm)
+	raftState := w.Bytes()
+
+	rf.persister.Save(raftState, snapshot)
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderIdx         int
+	Data              []byte
+	LastIncludedIndex int
+	LastIncludedTerm  int
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	if rf.killed() {
+		return
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// fmt.Printf("leader%v向节点%v安装快照，任期%v，快照最后一条日志索引%v，当前节点最后一条日志索引%v\n",
+	// 	args.LeaderIdx, rf.me, args.Term, args.LastIncludedIndex, rf.lastSnapshotIndex)
+	// 老东西，不用管
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	// 新的任期需要更新状态
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.voteFor = -1
+		rf.role = Follower
+		rf.leaderIdx = args.LeaderIdx
+		rf.persist()
+	}
+
+	if args.LastIncludedIndex <= rf.lastSnapshotIndex {
+		// 不需要安装
+		reply.Term = rf.currentTerm
+		rf.persist()
+		return
+	}
+
+	if args.LastIncludedIndex > rf.commitIdx {
+		rf.commitIdx = args.LastIncludedIndex
+	}
+	if args.LastIncludedIndex > rf.lastAppliedIdx {
+		rf.lastAppliedIdx = args.LastIncludedIndex
+	}
+
+	// 和 snapshot 有区别
+	{
+		rf.logs = make([]LogEntry, 0)
+
+		rf.lastSnapshotIndex = args.LastIncludedIndex
+
+		rf.lastSnapshotTerm = args.LastIncludedTerm
+
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+
+		e.Encode(rf.currentTerm)
+		e.Encode(rf.voteFor)
+		e.Encode(rf.logs)
+		e.Encode(rf.lastSnapshotIndex)
+		e.Encode(rf.lastSnapshotTerm)
+		raftState := w.Bytes()
+		// fmt.Println("同步成功")
+		rf.persister.Save(raftState, args.Data)
+	}
+
+	reply.Term = rf.currentTerm
+
+	data := args.Data
+	snapshotTerm := args.LastIncludedTerm
+	snapshotIndex := args.LastIncludedIndex
+
+	msg := raftapi.ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      data,
+		SnapshotTerm:  snapshotTerm,
+		SnapshotIndex: snapshotIndex,
+	}
+
+	go func() {
+		rf.applyCh <- msg
+	}()
+}
+
+func (rf *Raft) installSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	return rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 }
 
 // example RequestVote RPC arguments structure.
@@ -562,6 +706,7 @@ func (rf *Raft) StartElection() {
 }
 
 func (rf *Raft) SendHeartBeat() {
+	// fmt.Printf("leader%v 发送心跳\n", rf.leaderIdx)
 	rf.mu.Lock()
 	if rf.role != Leader || rf.killed() {
 		rf.mu.Unlock()
@@ -669,6 +814,32 @@ func (rf *Raft) SendHeartBeat() {
 				// -1 表示缺日志
 				if reply.ConflictTerm == -1 {
 					rf.nextIndex[server] = reply.ConflictIndex
+					if reply.ConflictIndex < rf.lastSnapshotIndex {
+						rf.nextIndex[server] = rf.lastSnapshotIndex + 1
+						installArgs := &InstallSnapshotArgs{
+							Term:              term,
+							LeaderIdx:         me,
+							LastIncludedIndex: rf.lastSnapshotIndex,
+							LastIncludedTerm:  rf.lastSnapshotTerm,
+							Data:              rf.persister.ReadSnapshot(),
+						}
+						installReply := &InstallSnapshotReply{}
+						rf.mu.Unlock()
+						ok := rf.installSnapshot(server, installArgs, installReply)
+						if !ok {
+							continue
+						}
+						rf.mu.Lock()
+						if installReply.Term > rf.currentTerm {
+							rf.currentTerm = installReply.Term
+							rf.role = Follower
+							rf.leaderIdx = -1
+							rf.voteFor = -1
+							rf.persist()
+							rf.mu.Unlock()
+							return
+						}
+					}
 				} else {
 					// 不是 -1 并且 false 表示有冲突
 					idx := reply.ConflictIndex
@@ -677,6 +848,33 @@ func (rf *Raft) SendHeartBeat() {
 						idx--
 					}
 					rf.nextIndex[server] = idx
+					// 对方日志太老了，需要安装快照
+					if idx < rf.lastSnapshotIndex || reply.ConflictTerm < rf.lastSnapshotTerm {
+						rf.nextIndex[server] = rf.lastSnapshotIndex + 1
+						installArgs := &InstallSnapshotArgs{
+							Term:              term,
+							LeaderIdx:         me,
+							LastIncludedIndex: rf.lastSnapshotIndex,
+							LastIncludedTerm:  rf.lastSnapshotTerm,
+							Data:              rf.persister.ReadSnapshot(),
+						}
+						installReply := &InstallSnapshotReply{}
+						rf.mu.Unlock()
+						ok := rf.installSnapshot(server, installArgs, installReply)
+						if !ok {
+							continue
+						}
+						rf.mu.Lock()
+						if installReply.Term > rf.currentTerm {
+							rf.currentTerm = installReply.Term
+							rf.role = Follower
+							rf.leaderIdx = -1
+							rf.voteFor = -1
+							rf.persist()
+							rf.mu.Unlock()
+							return
+						}
+					}
 				}
 				rf.mu.Unlock()
 				// for 循环没结束，说明同步失败，继续 for 循环，直到同步成功
@@ -685,7 +883,7 @@ func (rf *Raft) SendHeartBeat() {
 	}
 }
 
-func (rf *Raft) applyLoop(applyCh chan raftapi.ApplyMsg) {
+func (rf *Raft) applyLoop() {
 	for !rf.killed() {
 		rf.mu.Lock()
 		var msgs []raftapi.ApplyMsg
@@ -697,11 +895,11 @@ func (rf *Raft) applyLoop(applyCh chan raftapi.ApplyMsg) {
 				CommandIndex: rf.lastAppliedIdx,
 			})
 		}
+		rf.mu.Unlock()
 		// 这里必须在锁内apply，防止竞态
 		for _, msg := range msgs {
-			applyCh <- msg
+			rf.applyCh <- msg
 		}
-		rf.mu.Unlock()
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -718,6 +916,7 @@ func (rf *Raft) applyLoop(applyCh chan raftapi.ApplyMsg) {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	rf := &Raft{}
+	rf.mu = sync.Mutex{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
@@ -741,6 +940,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.applyLoop(applyCh)
+	go rf.applyLoop()
 	return rf
 }
