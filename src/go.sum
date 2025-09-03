@@ -1,2 +1,4 @@
 github.com/anishathalye/porcupine v1.0.0 h1:93eF6d26IMDky+G4h8FcLuYp1oO+no8a//I7asq/oKI=
 github.com/anishathalye/porcupine v1.0.0/go.mod h1:WM0SsFjWNl2Y4BqHr/E/ll2yY1GY1jqn+W7Z/84Zoog=
+github.com/bwmarrin/snowflake v0.3.0 h1:xm67bEhkKh6ij1790JB83OujPR5CzNe8QuQqAgISZN0=
+github.com/bwmarrin/snowflake v0.3.0/go.mod h1:NdZxfVWX+oR6y2K0o6qAYv6gIOP9rjG0/E9WsDpxqwE=
