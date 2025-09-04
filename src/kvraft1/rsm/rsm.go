@@ -87,7 +87,7 @@ func (rsm *RSM) ApplyMsg() {
 			op := msg.Command.(Op)
 			res := rsm.sm.DoOp(op.Req)
 			// fmt.Println("RSM: got apply msg for op", op.Id, "res", res)
-			if _, ok := rsm.resMap[op.Id]; !ok || rsm.me != op.Me {
+			if _, ok := rsm.resMap[op.Id]; !ok {
 				rsm.mu.Unlock()
 				continue
 			}
@@ -137,8 +137,9 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
-
+	// defer fmt.Printf("%v 退出\n", rsm.me)
 	for {
+		// fmt.Printf("%v 等待\n", rsm.me)
 		select {
 		case res := <-ch:
 			return rpc.OK, res
@@ -153,10 +154,6 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 				rsm.mu.Unlock()
 				return rpc.ErrWrongLeader, nil
 			}
-
-		case <-time.After(time.Second * 10):
-			return rpc.ErrWrongLeader, nil
 		}
 	}
-
 }

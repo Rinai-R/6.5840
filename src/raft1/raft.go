@@ -583,7 +583,7 @@ func (rf *Raft) generateElectionTimeout() time.Duration {
 func (rf *Raft) ticker() {
 	// 启动一个 goroutine 来定期发送心跳
 	go func() {
-		heartbeatTicker := time.NewTicker(50 * time.Millisecond)
+		heartbeatTicker := time.NewTicker(30 * time.Millisecond)
 		defer heartbeatTicker.Stop()
 
 		for !rf.killed() {
