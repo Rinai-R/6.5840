@@ -76,6 +76,10 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	data := persister.ReadSnapshot()
+	if len(data) != 0 {
+		rsm.sm.Restore(data)
+	}
 	go rsm.ApplyMsg()
 	return rsm
 }
@@ -86,6 +90,11 @@ func (rsm *RSM) ApplyMsg() {
 		if msg.CommandValid {
 			op := msg.Command.(Op)
 			res := rsm.sm.DoOp(op.Req)
+			if rsm.shouldSnapshot() {
+				// fmt.Printf("server %d 触发快照，raft state %d\n", rsm.me, rsm.rf.PersistBytes())
+				rsm.rf.Snapshot(msg.CommandIndex, rsm.sm.Snapshot())
+				// fmt.Printf("server %d 快照完成，raft state %d\n", rsm.me, rsm.rf.PersistBytes())
+			}
 			// fmt.Println("RSM: got apply msg for op", op.Id, "res", res)
 			if _, ok := rsm.resMap[op.Id]; !ok {
 				rsm.mu.Unlock()
@@ -102,6 +111,13 @@ func (rsm *RSM) ApplyMsg() {
 		}
 		rsm.mu.Unlock()
 	}
+}
+
+func (rsm *RSM) shouldSnapshot() bool {
+	if rsm.maxraftstate == -1 {
+		return false
+	}
+	return rsm.rf.PersistBytes() > rsm.maxraftstate/10*9
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
