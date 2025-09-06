@@ -47,6 +47,7 @@ type Raft struct {
 	applyCh           chan raftapi.ApplyMsg // 用于通知 leader 节点 apply 日志
 	lastSnapshotIndex int                   // 最后一次 snapshot 的索引
 	lastSnapshotTerm  int                   // 最后一次 snapshot 的任期
+	LogSubmitCh       chan struct{}
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -534,6 +535,7 @@ func (rf *Raft) sendHeartBeat(server int, args *AppendEntriesArgs, reply *Append
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer kickOnce(rf.LogSubmitCh)
 
 	if rf.role != Leader || rf.killed() {
 		return -1, -1, false
@@ -555,6 +557,25 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	//     fmt.Printf("节点%v写入日志命令%v, 日志长度%v\n", rf.me, command, rf.logs)
 	// }
 	return index, term, isLeader
+}
+
+func kickOnce(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (rf *Raft) speedUpSubmitLog() {
+	for !rf.killed() {
+		select {
+		case <-rf.LogSubmitCh:
+			rf.SendHeartBeat()
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -583,7 +604,7 @@ func (rf *Raft) generateElectionTimeout() time.Duration {
 func (rf *Raft) ticker() {
 	// 启动一个 goroutine 来定期发送心跳
 	go func() {
-		heartbeatTicker := time.NewTicker(30 * time.Millisecond)
+		heartbeatTicker := time.NewTicker(75 * time.Millisecond)
 		defer heartbeatTicker.Stop()
 
 		for !rf.killed() {
@@ -933,6 +954,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 	rf.dead = 0
+	rf.LogSubmitCh = make(chan struct{}, 1)
 	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash
@@ -941,5 +963,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.applyLoop()
+	go rf.speedUpSubmitLog()
 	return rf
 }
