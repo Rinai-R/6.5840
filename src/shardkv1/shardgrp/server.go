@@ -1,7 +1,6 @@
 package shardgrp
 
 import (
-	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -171,7 +170,7 @@ func (kv *KVServer) DoOp(req any) any {
 		// 	Req.Key, Req.Value, Req.Version, Req.ClientId, Req.ReqId)
 		// 有数据，判断版本号是否对得上
 		if Req.Version != KV.Ver {
-			fmt.Println("key= ", Req.Key, "版本错误！", Req.Version, "!=", KV.Ver)
+			// fmt.Println("key= ", Req.Key, "版本错误！", Req.Version, "!=", KV.Ver)
 			reply.Err = rpc.ErrVersion
 			kv.StoreLastApplied(Req.ClientId, Req.ReqId, reply)
 			return reply
