@@ -1,9 +1,6 @@
 package shardgrp
 
 import (
-	"math/rand"
-	"sync"
-
 	"6.5840/kvsrv1/rpc"
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp/shardrpc"
@@ -18,20 +15,26 @@ type Clerk struct {
 	cacheLeaderIdx int
 	clientId       int64
 	requestId      int64
-	mu             sync.Mutex
 }
 
 func MakeClerk(clnt *tester.Clnt, servers []string) *Clerk {
 	ck := &Clerk{
 		clnt:           clnt,
 		servers:        servers,
-		maxQueryNum:    len(servers) / 2 * 3,
+		maxQueryNum:    len(servers) * 2,
 		cacheLeaderIdx: 0,
-		clientId:       rand.Int63(),
+		clientId:       0,
 		requestId:      0,
-		mu:             sync.Mutex{},
 	}
 	return ck
+}
+
+func (ck *Clerk) SetClientId(clientId int64) {
+	ck.clientId = clientId
+}
+
+func (ck *Clerk) SetRequestId(requestId int64) {
+	ck.requestId = requestId
 }
 
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
@@ -40,14 +43,10 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	defer func() {
 		ck.cacheLeaderIdx = i
 	}()
-	ck.mu.Lock()
-	ck.requestId++
-	reqId := ck.requestId
-	ck.mu.Unlock()
 	args := shardrpc.GetArgs{
 		Key:      key,
 		ClientId: ck.clientId,
-		ReqId:    reqId,
+		ReqId:    ck.requestId,
 	}
 	reply := shardrpc.GetReply{}
 	var ok bool
@@ -73,16 +72,12 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	defer func() {
 		ck.cacheLeaderIdx = i
 	}()
-	ck.mu.Lock()
-	ck.requestId++
-	reqId := ck.requestId
-	ck.mu.Unlock()
 	args := shardrpc.PutArgs{
 		Key:      key,
 		Value:    value,
 		Version:  version,
 		ClientId: ck.clientId,
-		ReqId:    reqId,
+		ReqId:    ck.requestId,
 	}
 	reply := shardrpc.PutReply{}
 	var ok bool

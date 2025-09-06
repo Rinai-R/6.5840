@@ -10,6 +10,7 @@ package shardkv
 
 import (
 	"math/rand"
+	"sync"
 	"time"
 
 	"6.5840/kvsrv1/rpc"
@@ -24,14 +25,21 @@ type Clerk struct {
 	clnt *tester.Clnt
 	sck  *shardctrler.ShardCtrler
 	// You will have to modify this struct.
+
+	clientId  int64
+	requestId int64
+	mu        *sync.Mutex
 }
 
 // The tester calls MakeClerk and passes in a shardctrler so that
 // client can call it's Query method
 func MakeClerk(clnt *tester.Clnt, sck *shardctrler.ShardCtrler) kvtest.IKVClerk {
 	ck := &Clerk{
-		clnt: clnt,
-		sck:  sck,
+		clnt:      clnt,
+		sck:       sck,
+		clientId:  rand.Int63(),
+		requestId: 0,
+		mu:        &sync.Mutex{},
 	}
 	// You'll have to add code here.
 	return ck
@@ -43,11 +51,19 @@ func MakeClerk(clnt *tester.Clnt, sck *shardctrler.ShardCtrler) kvtest.IKVClerk 
 // responsible for key.  You can make a clerk for that group by
 // calling shardgrp.MakeClerk(ck.clnt, servers).
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
+	ck.mu.Lock()
+	ck.requestId++
+	ReqId := ck.requestId
+	clntId := ck.clientId
+	ck.mu.Unlock()
+
 	for {
 		cfg := ck.sck.Query()
 		shard := shardcfg.Key2Shard(key)
 		svcs := cfg.Groups[cfg.Shards[shard]]
 		clnt := shardgrp.MakeClerk(ck.clnt, svcs)
+		clnt.SetClientId(clntId)
+		clnt.SetRequestId(ReqId)
 		// fmt.Println("Get---------------------------------------------")
 		value, ver, err := clnt.Get(key)
 		// fmt.Println("got value", value, "version", ver, "err", err)
@@ -64,11 +80,19 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 
 // Put a key to a shard group.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
+	ck.mu.Lock()
+	ck.requestId++
+	ReqId := ck.requestId
+	clntId := ck.clientId
+	ck.mu.Unlock()
 	for {
 		cfg := ck.sck.Query()
 		shard := shardcfg.Key2Shard(key)
 		svcs := cfg.Groups[cfg.Shards[shard]]
 		clnt := shardgrp.MakeClerk(ck.clnt, svcs)
+		clnt.SetClientId(clntId)
+		clnt.SetRequestId(ReqId)
+
 		err := clnt.Put(key, value, version)
 
 		switch err {

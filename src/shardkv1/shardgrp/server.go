@@ -1,6 +1,7 @@
 package shardgrp
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -54,7 +55,7 @@ type LastApplied struct {
 
 // 有锁条件下调用
 func (kv *KVServer) IsDuplicate(cliendId int64, reqId int64) (any, bool) {
-	if last, ok := kv.last[cliendId]; ok && last.LastAppliedId == reqId {
+	if last, ok := kv.last[cliendId]; ok && last.LastAppliedId >= reqId {
 		return last.Reply, true
 	}
 	return nil, false
@@ -62,7 +63,10 @@ func (kv *KVServer) IsDuplicate(cliendId int64, reqId int64) (any, bool) {
 
 // 有锁条件下调用
 func (kv *KVServer) StoreLastApplied(cliendId int64, reqId int64, reply Reply) {
-	kv.last[cliendId] = &LastApplied{reqId, reply}
+	kv.last[cliendId] = &LastApplied{
+		LastAppliedId: reqId,
+		Reply:         reply,
+	}
 }
 
 type KeyValue struct {
@@ -163,8 +167,11 @@ func (kv *KVServer) DoOp(req any) any {
 			kv.StoreLastApplied(Req.ClientId, Req.ReqId, reply)
 			return reply
 		}
+		// fmt.Printf("Put Key= %s, Value= %s, Version= %d， clientid= %d, reqid= %d\n",
+		// 	Req.Key, Req.Value, Req.Version, Req.ClientId, Req.ReqId)
 		// 有数据，判断版本号是否对得上
 		if Req.Version != KV.Ver {
+			fmt.Println("key= ", Req.Key, "版本错误！", Req.Version, "!=", KV.Ver)
 			reply.Err = rpc.ErrVersion
 			kv.StoreLastApplied(Req.ClientId, Req.ReqId, reply)
 			return reply
