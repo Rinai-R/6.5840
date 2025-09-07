@@ -48,6 +48,55 @@ func MakeShardCtrler(clnt *tester.Clnt) *ShardCtrler {
 // controller. In part A, this method doesn't need to do anything. In
 // B and C, this method implements recovery.
 func (sck *ShardCtrler) InitController() {
+	for {
+		// 和 ChangeConfigTo() 的思路差不多，这里先检查 next 的版本号。
+		curData, curVer, err := sck.Get(ConfigCurrent)
+		if err != rpc.OK {
+			log.Printf("get current failed: %v", err)
+			continue
+		}
+
+		next, _, err := sck.Get(ConfigNext)
+		if err != rpc.OK {
+			log.Printf("get next failed: %v", err)
+			continue
+		}
+		if next == "" {
+			return
+		}
+
+		new := shardcfg.FromString(string(next))
+
+		cur := shardcfg.FromString(string(curData))
+
+		if new.Num <= cur.Num {
+			return
+		}
+		// 迁移前再次确认 current 还在我们看到的版本
+		_, curVer2, err := sck.Get(ConfigCurrent)
+		if err != rpc.OK {
+			continue
+		}
+		if curVer2 != curVer {
+			// 有人抢先了，重试
+			continue
+		}
+
+		oldCfg := shardcfg.FromString(string(curData))
+		targetVer := shardcfg.Tnum(curVer + 1)
+		sck.MigrateData(new, oldCfg, targetVer)
+
+		err = sck.Put(ConfigCurrent, new.String(), curVer)
+		if err == rpc.ErrMaybe {
+			// 不确定是否成功，重试
+			continue
+		}
+		if err == rpc.OK {
+			// log.Printf("Changed config to version %d", curVer+1)
+			// 仅仅在这里才会返回
+			return
+		}
+	}
 }
 
 // Called once by the tester to supply the first configuration.  You
